@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Campus Navigator</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <style>
+    body { margin: 0; }
+    #map { height: 100vh; }
+    #panel { position: absolute; top: 10px; left: 50px; z-index: 1000;
+             background: white; padding: 10px; border-radius: 6px;
+             font-family: Arial; font-size: 14px; width: 240px; }
+    #panel select, #panel button { width: 100%; margin-top: 6px; padding: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <b>Find a route</b>
+    <select id="from"></select>
+    <select id="to"></select>
+    <button id="go">Find route</button>
+    <button id="locate">Use my location as start</button>
+    <button id="trace">Trace a road (off)</button>
+    <textarea id="traceOut" rows="4" style="width:100%;margin-top:6px;display:none"></textarea>
+    <div id="result" style="margin-top:8px"></div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script>
+    // ===== MAP (satellite + street switch) =====
+    const map = L.map("map").setView([12.314900, 76.771800], 18);
+
+    const satellite = L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      { maxZoom: 19, maxNativeZoom: 18 }
+    ).addTo(map);
+
+    const street = L.tileLayer(
+      "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19 }
+    );
+
+    L.control.layers({ "Satellite": satellite, "Street": street }).addTo(map);
+
+    // ===== YOUR CAMPUS DATA: BUILDINGS =====
+    const buildings = {
+      gate:       { name: "Main Gate",            pos: [12.315748, 76.771077] },
+      admin:      { name: "Administrative Block", pos: [12.314739, 76.770747] },
+      cafeteria:  { name: "Cafeteria",            pos: [12.315045, 76.771568] },
+      civil:      { name: "Civil Block",          pos: [12.315211, 76.772131] },
+      electrical: { name: "Electrical Block",     pos: [12.315242, 76.772686] },
+      mechanical: { name: "Mechanical Block",     pos: [12.315009, 76.773319] },
+      boys:       { name: "Boys Hostel",          pos: [12.314626, 76.771924] },
+      girls:      { name: "Girls Hostel",         pos: [12.314136, 76.771291] },
+      lib:        { name: "Library",              pos: [12.31465, 76.770441] },
+      amphi:      { name: "Amphitheatre",         pos: [12.314537, 76.771495] },
+      throwball:  { name: "Throwball court",      pos: [12.314909, 76.772364] },
+      basketball: { name: "Basketball court",     pos: [12.314949, 76.771978] },
+      cricket:    { name: "Cricket ground",       pos: [12.314891, 76.772458] },
+    };
+
+    // ===== YOUR CAMPUS DATA: PATHS =====
+    const paths = [
+["gate", "admin", [[12.315232, 76.771219],[12.314857, 76.771037],[12.314867, 76.770777]]],
+["gate", "civil", [[12.315232, 76.771219],[12.315192, 76.771611],[12.315174, 76.771833]]], 
+      ["admin", "lib", [[12.314765, 76.770455]]],
+      ["admin", "cafeteria", [[12.314867, 76.770777],[12.314857, 76.771037],[12.315232, 76.771222],[12.315195, 76.771608]]],
+      ["cafeteria", "civil", [[12.315195, 76.771608],[12.315174, 76.771815]]],
+      ["cafeteria", "amphi", [[12.315064, 76.771458],[12.314859, 76.771326]]],
+      ["amphi", "girls", [[12.314385, 76.771265]]],
+      ["amphi","boys",[[12.314718, 76.771713]]],
+      ["boys", "basketball", []],
+      ["basketball", "throwball", [[12.315022, 76.772016],]],
+      ["throwball", "cricket", [[12.314925, 76.772415]]],
+["civil", "electrical", [[12.315197, 76.772026],[12.315108,76.772024],[12.315025, 76.772477],[12.315142, 76.772533],[12.315135, 76.772673]]],
+      ["electrical", "mechanical", [[12.315135, 76.772673],[12.315103, 76.772678],[12.315035, 76.773008]]]
+    ];
+
+    // ===== CHECK: every name in paths must exist in buildings =====
+    const missing = [];
+    paths.forEach(function (p) {
+      [p[0], p[1]].forEach(function (key) {
+        if (!buildings[key] && !missing.includes(key)) missing.push(key);
+      });
+    });
+    if (missing.length) {
+      alert("These names are in paths but not in buildings: " + missing.join(", "));
+    }
+
+    // ===== HELPER FUNCTIONS =====
+    // Full list of points for a road: start, bends, end
+    function roadPoints(p) {
+      return [buildings[p[0]].pos].concat(p[2] || []).concat([buildings[p[1]].pos]);
+    }
+
+    // Length of a road in metres, adding up every little segment
+    function roadLength(points) {
+      let total = 0;
+      for (let i = 0; i < points.length - 1; i++) {
+        total += L.latLng(points[i]).distanceTo(L.latLng(points[i + 1]));
+      }
+      return total;
+    }
+
+    // ===== DRAW MARKERS (click a building to route to it) =====
+    let tracing = false;   // true while the trace tool is on
+
+    Object.keys(buildings).forEach(function (key) {
+      const b = buildings[key];
+      if (b.junction) {
+        L.circleMarker(b.pos, { radius: 5, color: "orange" }).addTo(map).bindTooltip(b.name);
+      } else {
+        L.marker(b.pos).addTo(map).bindTooltip(b.name).on("click", function () {
+          if (tracing) return;
+          toSel.value = key;
+          document.getElementById("go").click();
+        });
+      }
+    });
+
+    // ===== DRAW ROADS (yellow) =====
+    paths.forEach(function (p) {
+      if (!buildings[p[0]] || !buildings[p[1]]) return;
+      const pts = roadPoints(p);
+      L.polyline(pts, { color: "yellow", weight: 3 })
+        .addTo(map)
+        .bindTooltip(Math.round(roadLength(pts)) + " m");
+    });
+
+    // ===== BUILD THE GRAPH =====
+    const graph = {};
+    const edgePoints = {};
+    Object.keys(buildings).forEach(function (k) { graph[k] = []; });
+    paths.forEach(function (p) {
+      if (!buildings[p[0]] || !buildings[p[1]]) return;
+      const pts = roadPoints(p);
+      const d = roadLength(pts);
+      graph[p[0]].push({ to: p[1], d: d });
+      graph[p[1]].push({ to: p[0], d: d });
+      edgePoints[p[0] + "|" + p[1]] = pts;
+      edgePoints[p[1] + "|" + p[0]] = pts.slice().reverse();
+    });
+
+    // ===== DIJKSTRA'S ALGORITHM =====
+    function dijkstra(start, end) {
+      const dist = {}, prev = {}, done = {};
+      Object.keys(graph).forEach(function (k) { dist[k] = Infinity; });
+      dist[start] = 0;
+
+      while (true) {
+        // pick the unvisited place with the smallest known distance
+        let current = null;
+        Object.keys(dist).forEach(function (k) {
+          if (!done[k] && dist[k] < Infinity &&
+              (current === null || dist[k] < dist[current])) {
+            current = k;
+          }
+        });
+        if (current === null || current === end) break;
+        done[current] = true;
+
+        // check if going through "current" is a shorter way to its neighbours
+        graph[current].forEach(function (edge) {
+          const newDist = dist[current] + edge.d;
+          if (newDist < dist[edge.to]) {
+            dist[edge.to] = newDist;
+            prev[edge.to] = current;
+          }
+        });
+      }
+
+      if (dist[end] === Infinity) return null;
+
+      // walk backwards from the end to rebuild the path
+      const path = [end];
+      while (path[0] !== start) path.unshift(prev[path[0]]);
+      return { path: path, meters: dist[end] };
+    }
+
+    // ===== DROPDOWNS =====
+    const fromSel = document.getElementById("from");
+    const toSel = document.getElementById("to");
+    Object.keys(buildings).forEach(function (k) {
+      if (!buildings[k].junction) {
+        fromSel.add(new Option(buildings[k].name, k));
+        toSel.add(new Option(buildings[k].name, k));
+      }
+    });
+    toSel.selectedIndex = 1;
+
+    // ===== FIND ROUTE BUTTON =====
+    const routeLayer = L.layerGroup().addTo(map);
+    document.getElementById("go").onclick = function () {
+      routeLayer.clearLayers();
+      const result = document.getElementById("result");
+
+      if (fromSel.value === toSel.value) {
+        result.textContent = "Start and destination are the same place.";
+        return;
+      }
+
+      const r = dijkstra(fromSel.value, toSel.value);
+      if (!r) {
+        result.textContent = "No route found. Check that your paths connect these two places.";
+        return;
+      }
+
+      let points = [];
+      for (let i = 0; i < r.path.length - 1; i++) {
+        points = points.concat(edgePoints[r.path[i] + "|" + r.path[i + 1]]);
+      }
+      L.polyline(points, { color: "red", weight: 6 }).addTo(routeLayer);
+      map.fitBounds(L.polyline(points).getBounds(), { padding: [60, 60] });
+
+      const names = r.path
+        .filter(function (k) { return !buildings[k].junction; })
+        .map(function (k) { return buildings[k].name; });
+      result.innerHTML = "<b>" + Math.round(r.meters) + " m</b>, about " +
+        Math.max(1, Math.round(r.meters / 80)) + " min walk<br>" + names.join(" → ");
+    };
+
+    // ===== USE MY LOCATION =====
+    document.getElementById("locate").onclick = function () {
+      navigator.geolocation.getCurrentPosition(function (position) {
+        const me = L.latLng(position.coords.latitude, position.coords.longitude);
+        L.circleMarker(me, { radius: 8, color: "blue" }).addTo(map).bindTooltip("You are here");
+
+        // pick the nearest building as the start
+        let nearest = null;
+        Object.keys(buildings).forEach(function (k) {
+          if (buildings[k].junction) return;
+          if (nearest === null || me.distanceTo(buildings[k].pos) < me.distanceTo(buildings[nearest].pos)) {
+            nearest = k;
+          }
+        });
+        fromSel.value = nearest;
+      }, function () {
+        alert("Could not get your location. Allow location access in the browser.");
+      });
+    };
+
+    // ===== MAP CLICK: coordinate popup, or road tracing =====
+    let tracePts = [];
+    const traceLine = L.polyline([], { color: "lime", weight: 4 }).addTo(map);
+
+    document.getElementById("trace").onclick = function () {
+      tracing = !tracing;
+      tracePts = [];
+      traceLine.setLatLngs([]);
+      this.textContent = tracing ? "Tracing ON: click along the road" : "Trace a road (off)";
+      const out = document.getElementById("traceOut");
+      out.style.display = tracing ? "block" : "none";
+      out.value = "";
+    };
+
+    map.on("click", function (e) {
+      const lat = +e.latlng.lat.toFixed(6);
+      const lng = +e.latlng.lng.toFixed(6);
+
+      if (tracing) {
+        tracePts.push([lat, lng]);
+        traceLine.setLatLngs(tracePts);
+        document.getElementById("traceOut").value = JSON.stringify(tracePts);
+      } else {
+        L.popup().setLatLng(e.latlng).setContent("[" + lat + ", " + lng + "]").openOn(map);
+      }
+    });
+  </script>
+</body>
+</html>
